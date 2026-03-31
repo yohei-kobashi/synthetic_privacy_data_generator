@@ -1,3 +1,4 @@
 __pycache__
 data/*
 panorama_negative_output/*
+!panorama_negative_output/panorama_positive_negative_dataset.jsonl
