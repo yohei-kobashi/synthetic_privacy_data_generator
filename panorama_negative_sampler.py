@@ -27,11 +27,11 @@ Example
 -------
 python panorama_negative_sampler.py \
   --dump-url https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream.xml.bz2 \
-  --sample-size 5000 \
+  --sample-size 1000 \
   --content-types social_media forum_post online_review comment online_ad \
   --entries-per-type 2 \
-  --model gpt-4.1-mini \
-  --quality-model gpt-4.1-mini \
+  --model gpt-5-mini \
+  --quality-model gpt-5-mini \
   --output-dir ./panorama_negative_output
 """
 
@@ -52,6 +52,7 @@ import threading
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -107,6 +108,15 @@ class FilterDecision:
     rule_flags: List[str]
     llm_flags: List[str]
     llm_rationale: str
+
+
+@dataclass
+class BinaryClassificationRow:
+    label: str
+    content_type: str
+    text: str
+    source: str
+    source_id: str
 
 
 # -----------------------------
@@ -363,13 +373,37 @@ def build_generation_prompt(
     article: WikiArticle,
     content_types: Sequence[str],
     entries_per_type: int,
+    few_shot_examples: Optional[Dict[str, List[str]]] = None,
 ) -> str:
     specs = "\n\n".join(CONTENT_TYPE_SPECS[t].format(n=entries_per_type) for t in content_types)
     labels = ", ".join(TYPE_LABEL_MAP[t] for t in content_types)
+    few_shot_section = ""
+    if few_shot_examples:
+        blocks: List[str] = []
+        for content_type in content_types:
+            label = TYPE_LABEL_MAP[content_type]
+            examples = few_shot_examples.get(label, [])
+            if not examples:
+                continue
+            example_lines = "\n".join(
+                f"- Example {idx}: {example_text}" for idx, example_text in enumerate(examples, start=1)
+            )
+            blocks.append(f"## {label} style examples\n{example_lines}")
+        if blocks:
+            few_shot_section = f"""
+
+# Style Reference Examples
+Use these PANORAMA examples as style references only.
+They are not factual sources for this article.
+Do not copy names, usernames, handles, locations, dates, contact details, or any unique identifiers from them.
+Treat bracketed placeholders as non-factual style cues only.
+
+{"\n\n".join(blocks)}
+""".rstrip()
 
     return f"""
 # Role
-You are a realistic text generation engine.
+You are a realistic syntetic data generation engine.
 
 # Objective
 Generate negative-sample online text varieties from a Wikipedia article.
@@ -385,6 +419,7 @@ The article is the ONLY factual source you may use.
 
 # Source Article Text
 {truncate_article(article.text)}
+{few_shot_section}
 
 # Data Generation Types and Requirements
 {specs}
@@ -399,6 +434,8 @@ The article is the ONLY factual source you may use.
 - Avoid adding controversial claims not grounded in the article.
 - Since these are negative samples, do not add synthetic PII.
 - Prefer faithful paraphrase over creative invention.
+- Match the stylistic register and structure of the style reference examples, while using only facts from the source article.
+- If a style example contains a username, location, date, handle, URL, phone number, or email, do not reuse it.
 
 # Output Format
 Return valid JSON only.
@@ -441,22 +478,124 @@ def _get_thread_openai_client(timeout: int, api_key_env: str = "OPENAI_API_KEY")
     return client
 
 
-def _responses_create_json(client, *, model: str, system_text: str, user_text: str, temperature: float, max_output_tokens: int) -> Dict:
-    response = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_text}]},
-        ],
-        text={"format": {"type": "text"}},
-        temperature=temperature,
-        max_output_tokens=max_output_tokens,
-    )
-    raw = response.output_text.strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Model did not return valid JSON. Raw output:\n{raw[:4000]}") from exc
+def _generation_json_schema(article_title: str, content_types: Sequence[str], entries_per_type: int) -> Dict[str, object]:
+    allowed_labels = [TYPE_LABEL_MAP[t] for t in content_types]
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string", "const": article_title},
+            "outputs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "content_type": {"type": "string", "enum": allowed_labels},
+                        "items": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": max(1, entries_per_type),
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["content_type", "items"],
+                },
+            },
+        },
+        "required": ["title", "outputs"],
+    }
+
+
+def _quality_filter_json_schema() -> Dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "pass": {"type": "boolean"},
+            "score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "flags": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "rationale": {"type": "string"},
+        },
+        "required": ["pass", "score", "flags", "rationale"],
+    }
+
+
+def _responses_create_json(
+    client,
+    *,
+    model: str,
+    system_text: str,
+    user_text: str,
+    max_output_tokens: int,
+    schema_name: str,
+    schema: Dict[str, object],
+    max_attempts: int = 3,
+) -> Dict:
+    last_error: Optional[Exception] = None
+    current_max_output_tokens = max_output_tokens
+
+    for attempt in range(1, max_attempts + 1):
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
+                {"role": "user", "content": [{"type": "input_text", "text": user_text}]},
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "schema": schema,
+                    "strict": True,
+                },
+                "verbosity": "low",
+            },
+            max_output_tokens=current_max_output_tokens,
+        )
+
+        if response.status == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            last_error = ValueError(
+                f"Model response incomplete for schema '{schema_name}'"
+                + (f": {details}" if details else "")
+            )
+            if getattr(details, "reason", None) == "max_output_tokens":
+                current_max_output_tokens = max(current_max_output_tokens + 400, current_max_output_tokens * 2)
+        elif response.status == "failed":
+            last_error = ValueError(
+                f"Model response failed for schema '{schema_name}': {response.error}"
+            )
+        else:
+            raw = response.output_text.strip()
+            if not raw:
+                last_error = ValueError(
+                    f"Model returned empty output for schema '{schema_name}' with status={response.status}"
+                )
+            else:
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    last_error = ValueError(
+                        f"Model did not return valid JSON for schema '{schema_name}'. Raw output:\n{raw[:4000]}"
+                    )
+                    last_error.__cause__ = exc
+
+        if attempt < max_attempts:
+            logger.warning(
+                "Retrying structured response for schema '%s' after attempt %d/%d: %s",
+                schema_name,
+                attempt,
+                max_attempts,
+                last_error,
+            )
+            time.sleep(0.5 * attempt)
+
+    assert last_error is not None
+    raise last_error
 
 
 def generate_formats_with_openai(
@@ -466,17 +605,18 @@ def generate_formats_with_openai(
     content_types: Sequence[str],
     entries_per_type: int,
     model: str,
-    temperature: float,
     max_output_tokens: int,
+    few_shot_examples: Optional[Dict[str, List[str]]] = None,
 ) -> Dict:
-    prompt = build_generation_prompt(article, content_types, entries_per_type)
+    prompt = build_generation_prompt(article, content_types, entries_per_type, few_shot_examples)
     return _responses_create_json(
         client,
         model=model,
         system_text="You strictly follow instructions and return valid JSON only.",
         user_text=prompt,
-        temperature=temperature,
         max_output_tokens=max_output_tokens,
+        schema_name="panorama_generation",
+        schema=_generation_json_schema(article.title, content_types, entries_per_type),
     )
 
 
@@ -517,6 +657,21 @@ URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 HANDLE_RE = re.compile(r"(?<!\w)@[A-Za-z0-9_]{2,}")
 MULTISPACE_RE = re.compile(r"\s+")
 WORD_RE = re.compile(r"[A-Za-z0-9']+")
+LABEL_FIELD_RE = re.compile(
+    r"\b(username|user name|name|location|date|timestamp|time)\s*:\s*([^,\n]+)",
+    re.IGNORECASE,
+)
+
+
+def sanitize_few_shot_text(text: str) -> str:
+    text = LABEL_FIELD_RE.sub(lambda m: f"{m.group(1)}: [{m.group(1).lower().replace(' ', '_')}_placeholder]", text)
+    text = EMAIL_RE.sub("[email_placeholder]", text)
+    text = PHONE_RE.sub("[phone_placeholder]", text)
+    text = URL_RE.sub("[url_placeholder]", text)
+    text = HANDLE_RE.sub("[handle_placeholder]", text)
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "[date_placeholder]", text)
+    text = re.sub(r"\b\d{1,2}:\d{2}(?:\s?[AP]M)?\b", "[time_placeholder]", text, flags=re.IGNORECASE)
+    return MULTISPACE_RE.sub(" ", text).strip()
 
 
 def normalize_text_for_similarity(text: str) -> str:
@@ -694,7 +849,6 @@ def llm_quality_filter_candidate(
     content_type: str,
     text: str,
     model: str,
-    temperature: float,
     max_output_tokens: int,
 ) -> Tuple[bool, float, List[str], str]:
     prompt = build_quality_filter_prompt(article, content_type, text)
@@ -703,8 +857,9 @@ def llm_quality_filter_candidate(
         model=model,
         system_text="You are a strict data quality judge. Return valid JSON only.",
         user_text=prompt,
-        temperature=temperature,
         max_output_tokens=max_output_tokens,
+        schema_name="panorama_quality_filter",
+        schema=_quality_filter_json_schema(),
     )
     passed = bool(payload.get("pass", False))
     score = float(payload.get("score", 0.0))
@@ -723,7 +878,6 @@ def quality_filter_candidates(
     article: WikiArticle,
     candidates: List[CandidateItem],
     quality_model: str,
-    quality_temperature: float,
     quality_max_output_tokens: int,
     keep_per_type: int,
     min_combined_score: float,
@@ -738,7 +892,6 @@ def quality_filter_candidates(
             content_type=cand.content_type,
             text=cand.text,
             model=quality_model,
-            temperature=quality_temperature,
             max_output_tokens=quality_max_output_tokens,
         )
         combined = 0.45 * rule_score + 0.55 * llm_score
@@ -800,6 +953,287 @@ def save_sampled_articles(path: Path, articles: Sequence[WikiArticle]) -> None:
     save_jsonl(path, [asdict(a) for a in articles])
 
 
+def load_jsonl(path: Path) -> List[Dict]:
+    rows: List[Dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def load_cached_results_from_per_article(per_article_dir: Path) -> Tuple[List[Dict], List[Dict]]:
+    accepted_rows: List[Dict] = []
+    decisions: List[Dict] = []
+    if not per_article_dir.exists():
+        logger.info("No per-article cache directory found at %s", per_article_dir)
+        return accepted_rows, decisions
+
+    json_paths = sorted(per_article_dir.glob("*.json"))
+    for path in json_paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Could not read per-article payload %s: %s", path, exc)
+            continue
+        accepted = payload.get("accepted_rows", [])
+        filter_decisions = payload.get("filter_decisions", [])
+        if isinstance(accepted, list):
+            accepted_rows.extend(row for row in accepted if isinstance(row, dict))
+        if isinstance(filter_decisions, list):
+            decisions.extend(row for row in filter_decisions if isinstance(row, dict))
+
+    logger.info(
+        "Loaded %d accepted rows and %d filter decisions from %d per-article payload(s)",
+        len(accepted_rows),
+        len(decisions),
+        len(json_paths),
+    )
+    return accepted_rows, decisions
+
+
+def sample_existing_negative_rows(
+    per_article_dir: Path,
+    *,
+    content_types: Sequence[str],
+    sample_size: int,
+    seed: int,
+) -> List[Dict]:
+    rows, _ = load_cached_results_from_per_article(per_article_dir)
+    by_type: Dict[str, List[Dict]] = {}
+    for row in rows:
+        content_type = str(row.get("content_type", "")).strip()
+        if content_type in content_types:
+            by_type.setdefault(content_type, []).append(row)
+
+    rng = random.Random(seed)
+    sampled: List[Dict] = []
+    unique_counts: Dict[str, int] = {}
+    for content_type in content_types:
+        items = list(by_type[content_type])
+        rng.shuffle(items)
+        seen_source_titles: Set[str] = set()
+        selected_for_type: List[Dict] = []
+        for item in items:
+            source_title = str(item.get("source_title", "")).strip()
+            if source_title in seen_source_titles:
+                continue
+            seen_source_titles.add(source_title)
+            selected_for_type.append(item)
+            if len(selected_for_type) >= sample_size:
+                break
+        unique_counts[content_type] = len(selected_for_type)
+        sampled.extend(selected_for_type)
+    logger.info("Cached negative counts by content type after unique source_title sampling: %s", unique_counts)
+    return sampled
+
+
+def has_enough_cached_negative_rows(
+    per_article_dir: Path,
+    *,
+    content_types: Sequence[str],
+    sample_size: int,
+    seed: int,
+) -> Tuple[bool, List[Dict], Dict[str, int]]:
+    sampled_rows = sample_existing_negative_rows(
+        per_article_dir,
+        content_types=content_types,
+        sample_size=sample_size,
+        seed=seed,
+    )
+    counts = {content_type: 0 for content_type in content_types}
+    for row in sampled_rows:
+        counts[str(row["content_type"])] += 1
+    enough = all(counts[content_type] >= sample_size for content_type in content_types)
+    logger.info(
+        "Cached negative sufficiency check: enough=%s, required_per_type=%d, counts=%s",
+        enough,
+        sample_size,
+        counts,
+    )
+    return enough, sampled_rows, counts
+
+
+def _get_hf_token() -> str:
+    for env_name in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        token = os.getenv(env_name, "").strip()
+        if token:
+            return token
+    raise RuntimeError(
+        "PANORAMA is gated on Hugging Face. Set HF_TOKEN or HUGGINGFACE_HUB_TOKEN after accepting the dataset terms."
+    )
+
+
+def normalize_content_type_label(value: str) -> Optional[str]:
+    normalized = value.strip().lower()
+    alias_map = {
+        "social media": "Social Media",
+        "social_media": "Social Media",
+        "forum post": "Forum Post",
+        "forum_post": "Forum Post",
+        "online review": "Online Review",
+        "online_review": "Online Review",
+        "comment": "Comment",
+        "blog/news article comment": "Comment",
+        "blog_news_article_comment": "Comment",
+        "blog / news article comment": "Comment",
+        "online ad": "Online Ad",
+        "online_ad": "Online Ad",
+    }
+    if normalized in alias_map:
+        return alias_map[normalized]
+    fallback = normalized.replace("-", "_").replace(" ", "_")
+    return TYPE_LABEL_MAP.get(fallback)
+
+
+def normalize_hf_file_url(url: str) -> str:
+    return url.replace("/blob/", "/resolve/")
+
+
+def download_hf_file(url: str, dest_path: Path, token: str) -> Path:
+    resolved_url = normalize_hf_file_url(url)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if dest_path.exists() and dest_path.stat().st_size > 0:
+        logger.info("PANORAMA parquet already exists: %s", dest_path)
+        return dest_path
+
+    logger.info("Downloading PANORAMA parquet from %s", resolved_url)
+    req = urllib.request.Request(
+        resolved_url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "panorama-negative-sampler/2.0",
+        },
+    )
+    with urllib.request.urlopen(req) as response, open(dest_path, "wb") as f:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+    logger.info("Saved PANORAMA parquet to %s", dest_path)
+    return dest_path
+
+
+def iter_panorama_rows_from_parquet(parquet_path: Path) -> Iterator[Dict]:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("Please install pyarrow to read PANORAMA parquet files.") from exc
+
+    parquet_file = pq.ParquetFile(parquet_path)
+    for batch in parquet_file.iter_batches():
+        for row in batch.to_pylist():
+            if isinstance(row, dict):
+                yield row
+
+
+def sample_panorama_positive_rows(
+    *,
+    parquet_url: str,
+    parquet_path: Path,
+    content_types: Sequence[str],
+    sample_size: int,
+    seed: int,
+) -> List[Dict]:
+    hf_token = _get_hf_token()
+    requested_labels = [TYPE_LABEL_MAP[content_type] for content_type in content_types]
+    reservoirs: Dict[str, List[Dict]] = {label: [] for label in requested_labels}
+    seen_counts: Counter[str] = Counter()
+    rng = random.Random(seed)
+
+    local_parquet_path = download_hf_file(parquet_url, parquet_path, hf_token)
+    logger.info("Reading PANORAMA rows from %s", local_parquet_path)
+    for row in iter_panorama_rows_from_parquet(local_parquet_path):
+        text = str(row.get("text", "")).strip()
+        if not text:
+            continue
+
+        raw_content_type = row.get("content-type")
+        if raw_content_type is None:
+            raw_content_type = row.get("content_type")
+        if raw_content_type is None:
+            continue
+
+        content_type = normalize_content_type_label(str(raw_content_type))
+        if content_type not in reservoirs:
+            continue
+
+        seen_counts[content_type] += 1
+        candidate = {
+            "label": "positive",
+            "content_type": content_type,
+            "text": text,
+            "source": "PANORAMA",
+            "source_id": str(row.get("id", f"{content_type}-{seen_counts[content_type]}")),
+        }
+        bucket = reservoirs[content_type]
+        if len(bucket) < sample_size:
+            bucket.append(candidate)
+        else:
+            replace_index = rng.randint(0, seen_counts[content_type] - 1)
+            if replace_index < sample_size:
+                bucket[replace_index] = candidate
+
+    missing = [content_type for content_type in requested_labels if len(reservoirs[content_type]) < sample_size]
+    if missing:
+        counts = {content_type: len(reservoirs[content_type]) for content_type in requested_labels}
+        raise RuntimeError(
+            f"PANORAMA does not contain enough rows for requested content types. counts={counts}, required={sample_size}"
+        )
+
+    sampled: List[Dict] = []
+    for content_type in requested_labels:
+        sampled.extend(reservoirs[content_type])
+    logger.info("Sampled PANORAMA positives by content type: %s", {k: len(v) for k, v in reservoirs.items()})
+    return sampled
+
+
+def build_few_shot_examples(
+    panorama_rows: Sequence[Dict],
+    *,
+    content_types: Sequence[str],
+    max_examples_per_type: int,
+) -> Dict[str, List[str]]:
+    examples: Dict[str, List[str]] = {}
+    requested_labels = [TYPE_LABEL_MAP[content_type] for content_type in content_types]
+    for label in requested_labels:
+        examples[label] = []
+
+    for row in panorama_rows:
+        content_type = str(row.get("content_type", "")).strip()
+        if content_type not in examples or len(examples[content_type]) >= max_examples_per_type:
+            continue
+        sanitized = sanitize_few_shot_text(str(row.get("text", "")).strip())
+        if sanitized:
+            examples[content_type].append(sanitized)
+    return examples
+
+
+def build_binary_classification_rows(positive_rows: Sequence[Dict], negative_rows: Sequence[Dict], seed: int) -> List[Dict]:
+    combined: List[Dict] = []
+    for row in positive_rows:
+        combined.append(asdict(BinaryClassificationRow(**row)))
+    for row in negative_rows:
+        combined.append(
+            asdict(
+                BinaryClassificationRow(
+                    label="negative",
+                    content_type=str(row["content_type"]),
+                    text=str(row["text"]),
+                    source="synthetic_generation",
+                    source_id=str(row.get("source_page_id", "")),
+                )
+            )
+        )
+
+    rng = random.Random(seed)
+    rng.shuffle(combined)
+    return combined
+
+
 def stable_article_output_name(article: WikiArticle) -> str:
     digest = hashlib.md5(f"{article.page_id}:{article.title}".encode("utf-8")).hexdigest()[:10]
     safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", article.title)[:80].strip("_")
@@ -815,6 +1249,7 @@ def process_article(
     quality_model: str,
     requested_generation_count: int,
     per_article_dir: Path,
+    few_shot_examples: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[int, List[Dict], List[Dict]]:
     client = _get_thread_openai_client(timeout=args.timeout)
     per_article_path = per_article_dir / stable_article_output_name(article)
@@ -826,8 +1261,8 @@ def process_article(
         content_types=args.content_types,
         entries_per_type=requested_generation_count,
         model=args.model,
-        temperature=args.temperature,
         max_output_tokens=args.max_output_tokens,
+        few_shot_examples=few_shot_examples,
     )
     candidates = normalize_generated_payload(raw_payload, args.content_types)
     accepted_rows, decisions = quality_filter_candidates(
@@ -835,7 +1270,6 @@ def process_article(
         article=article,
         candidates=candidates,
         quality_model=quality_model,
-        quality_temperature=args.quality_temperature,
         quality_max_output_tokens=args.quality_max_output_tokens,
         keep_per_type=args.entries_per_type,
         min_combined_score=args.min_combined_score,
@@ -864,6 +1298,14 @@ def process_article(
 # -----------------------------
 # Main pipeline
 # -----------------------------
+def log_progress(prefix: str, completed: int, total: int) -> None:
+    if total <= 0:
+        logger.info("%s: 0/0 (0.0%%)", prefix)
+        return
+    pct = 100.0 * completed / total
+    logger.info("%s: %d/%d (%.1f%%)", prefix, completed, total, pct)
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PANORAMA-inspired negative sample generator")
     parser.add_argument(
@@ -878,7 +1320,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=Path("./data/enwiki-latest-pages-articles-multistream.xml.bz2"),
         help="Local path for the downloaded dump",
     )
-    parser.add_argument("--sample-size", type=int, default=5000)
+    parser.add_argument("--sample-size", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--content-types",
@@ -887,18 +1329,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=list(CONTENT_TYPE_SPECS.keys()),
         help="One or more content types to generate",
     )
-    parser.add_argument("--entries-per-type", type=int, default=2, help="Number of candidates to generate per style before filtering. Use 2 to get 0-2 retained outputs per style.")
+    parser.add_argument("--entries-per-type", type=int, default=5, help="Number of candidates to generate per style before filtering. Use 5 to get 0-5 retained outputs per style.")
     parser.add_argument("--model", type=str, default="gpt-5-mini")
     parser.add_argument("--quality-model", type=str, default="")
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--quality-temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=0.8, help="Deprecated and ignored for Responses API models that do not support temperature.")
+    parser.add_argument("--quality-temperature", type=float, default=0.2, help="Deprecated and ignored for Responses API models that do not support temperature.")
     parser.add_argument("--max-output-tokens", type=int, default=7000)
-    parser.add_argument("--quality-max-output-tokens", type=int, default=500)
+    parser.add_argument("--quality-max-output-tokens", type=int, default=2000)
+    parser.add_argument("--few-shot-per-type", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--max-workers", type=int, default=32, help="Number of articles to process concurrently for OpenAI API calls")
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
-    parser.add_argument("--resume", action="store_true", help="Skip articles whose output file already exists")
+    parser.add_argument("--force-regenerate", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="Reuse cached per-article outputs if present. Sampled articles are reused automatically from output-dir/sampled_articles.jsonl when that file exists.")
     parser.add_argument("--min-combined-score", type=float, default=0.68)
+    parser.add_argument(
+        "--panorama-parquet-url",
+        type=str,
+        default="https://huggingface.co/datasets/srirxml/PANORAMA/resolve/main/data/train-00000-of-00001.parquet",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("./panorama_negative_output"))
     return parser.parse_args(argv)
 
@@ -906,11 +1355,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     quality_model = args.quality_model or args.model
+    requested_labels = [TYPE_LABEL_MAP[content_type] for content_type in args.content_types]
 
     output_dir: Path = args.output_dir
     sampled_articles_path = output_dir / "sampled_articles.jsonl"
     generated_jsonl_path = output_dir / "generated_negative_samples.jsonl"
     filter_log_path = output_dir / "quality_filter_decisions.jsonl"
+    binary_dataset_path = output_dir / "panorama_positive_negative_dataset.jsonl"
+    panorama_parquet_path = output_dir / "cache" / "PANORAMA_train.parquet"
     per_article_dir = output_dir / "per_article"
     manifest_path = output_dir / "manifest.json"
 
@@ -919,95 +1371,176 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.max_workers < 1:
         raise ValueError("--max-workers must be >= 1")
 
-    _make_openai_client(timeout=args.timeout)
-
-    # Step 1: download dump
-    download_file(args.dump_url, args.dump_path)
-
-    # Step 2: sample articles
-    if sampled_articles_path.exists():
-        logger.info("Loading cached sampled articles from %s", sampled_articles_path)
-        sampled_articles: List[WikiArticle] = []
-        with open(sampled_articles_path, "r", encoding="utf-8") as f:
-            for line in f:
-                obj = json.loads(line)
-                sampled_articles.append(WikiArticle(**obj))
-    else:
-        sampled_articles = reservoir_sample_articles(args.dump_path, args.sample_size, args.seed)
-        save_sampled_articles(sampled_articles_path, sampled_articles)
-
-    logger.info("Sampled %d articles", len(sampled_articles))
-
     all_rows: List[Dict] = []
     all_decisions: List[Dict] = []
     requested_generation_count = args.entries_per_type
+    positive_rows: List[Dict] = []
+    few_shot_examples: Dict[str, List[str]] = {}
 
-    logger.info("Each style will generate %d candidate(s); every candidate that passes the PANORAMA-inspired filter will be retained.", requested_generation_count)
+    has_sufficient_cached_negatives, sampled_negative_rows, negative_counts = has_enough_cached_negative_rows(
+        per_article_dir,
+        content_types=requested_labels,
+        sample_size=args.sample_size,
+        seed=args.seed,
+    )
+    if args.force_regenerate:
+        logger.info("Forcing synthetic regeneration; cached negatives will not be used for skip decisions.")
+        has_sufficient_cached_negatives = False
 
-    pending_futures: Dict[concurrent.futures.Future[Tuple[int, List[Dict], List[Dict]]], Tuple[int, WikiArticle, Path]] = {}
-    completed_results: Dict[int, Tuple[List[Dict], List[Dict]]] = {}
+    if not has_sufficient_cached_negatives:
+        _make_openai_client(timeout=args.timeout)
 
-    for i, article in enumerate(sampled_articles, start=1):
-        per_article_path = per_article_dir / stable_article_output_name(article)
-        if args.resume and per_article_path.exists():
-            logger.info("[%d/%d] Skipping existing %s", i, len(sampled_articles), article.title)
-            try:
-                with open(per_article_path, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                accepted = payload.get("accepted_rows", [])
-                decisions = payload.get("filter_decisions", [])
-                all_rows.extend(accepted)
-                all_decisions.extend(decisions)
-            except Exception as exc:
-                logger.warning("Could not read cached article payload for %s: %s", article.title, exc)
-            continue
+        # Step 1: download dump
+        download_file(args.dump_url, args.dump_path)
 
-    articles_to_process: List[Tuple[int, WikiArticle, Path]] = []
-    for i, article in enumerate(sampled_articles, start=1):
-        per_article_path = per_article_dir / stable_article_output_name(article)
-        if not (args.resume and per_article_path.exists()):
-            articles_to_process.append((i, article, per_article_path))
+        # Step 2: sample articles
+        if sampled_articles_path.exists():
+            logger.info("Loading cached sampled articles from %s", sampled_articles_path)
+            sampled_articles: List[WikiArticle] = []
+            with open(sampled_articles_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    obj = json.loads(line)
+                    sampled_articles.append(WikiArticle(**obj))
+        else:
+            sampled_articles = reservoir_sample_articles(args.dump_path, args.sample_size, args.seed)
+            save_sampled_articles(sampled_articles_path, sampled_articles)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        for i, article, per_article_path in articles_to_process:
-            future = executor.submit(
-                process_article,
-                article_index=i,
-                total_articles=len(sampled_articles),
-                article=article,
-                args=args,
-                quality_model=quality_model,
-                requested_generation_count=requested_generation_count,
-                per_article_dir=per_article_dir,
-            )
-            pending_futures[future] = (i, article, per_article_path)
+        logger.info("Sampled %d articles", len(sampled_articles))
+        positive_rows = sample_panorama_positive_rows(
+            parquet_url=args.panorama_parquet_url,
+            parquet_path=panorama_parquet_path,
+            content_types=args.content_types,
+            sample_size=args.sample_size,
+            seed=args.seed,
+        )
+        few_shot_examples = build_few_shot_examples(
+            positive_rows,
+            content_types=args.content_types,
+            max_examples_per_type=args.few_shot_per_type,
+        )
+        if args.temperature != 0.8 or args.quality_temperature != 0.2:
+            logger.info("Ignoring --temperature / --quality-temperature for OpenAI Responses API calls.")
 
-        for future in concurrent.futures.as_completed(pending_futures):
-            i, article, per_article_path = pending_futures[future]
-            try:
-                article_index, accepted, decisions = future.result()
-                completed_results[article_index] = (accepted, decisions)
-            except Exception as exc:
-                logger.exception("Generation failed for '%s': %s", article.title, exc)
-                error_path = per_article_dir / (per_article_path.stem + ".error.txt")
-                error_path.write_text(str(exc), encoding="utf-8")
+        logger.info(
+            "Each style will generate %d candidate(s); every candidate that passes the PANORAMA-inspired filter will be retained.",
+            requested_generation_count,
+        )
 
-    for i in range(1, len(sampled_articles) + 1):
-        result = completed_results.get(i)
-        if result is None:
-            continue
-        accepted, decisions = result
-        all_rows.extend(accepted)
-        all_decisions.extend(decisions)
+        pending_futures: Dict[concurrent.futures.Future[Tuple[int, List[Dict], List[Dict]]], Tuple[int, WikiArticle, Path]] = {}
+        completed_results: Dict[int, Tuple[List[Dict], List[Dict]]] = {}
+        resumed_articles = 0
 
-    save_jsonl(generated_jsonl_path, all_rows)
-    save_jsonl(filter_log_path, all_decisions)
+        for i, article in enumerate(sampled_articles, start=1):
+            per_article_path = per_article_dir / stable_article_output_name(article)
+            if args.resume and per_article_path.exists():
+                logger.info("[%d/%d] Skipping existing %s", i, len(sampled_articles), article.title)
+                try:
+                    with open(per_article_path, "r", encoding="utf-8") as f:
+                        payload = json.load(f)
+                    accepted = payload.get("accepted_rows", [])
+                    decisions = payload.get("filter_decisions", [])
+                    all_rows.extend(accepted)
+                    all_decisions.extend(decisions)
+                    resumed_articles += 1
+                    if resumed_articles == 1 or resumed_articles % 100 == 0 or resumed_articles == len(sampled_articles):
+                        log_progress("Resume progress", resumed_articles, len(sampled_articles))
+                except Exception as exc:
+                    logger.warning("Could not read cached article payload for %s: %s", article.title, exc)
+                continue
+
+        articles_to_process: List[Tuple[int, WikiArticle, Path]] = []
+        for i, article in enumerate(sampled_articles, start=1):
+            per_article_path = per_article_dir / stable_article_output_name(article)
+            if not (args.resume and per_article_path.exists()):
+                articles_to_process.append((i, article, per_article_path))
+
+        if args.resume:
+            logger.info("Loaded %d cached article result(s)", resumed_articles)
+        log_progress("Articles queued for generation", len(articles_to_process), len(sampled_articles))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+            for i, article, per_article_path in articles_to_process:
+                future = executor.submit(
+                    process_article,
+                    article_index=i,
+                    total_articles=len(sampled_articles),
+                    article=article,
+                    args=args,
+                    quality_model=quality_model,
+                    requested_generation_count=requested_generation_count,
+                    per_article_dir=per_article_dir,
+                    few_shot_examples=few_shot_examples,
+                )
+                pending_futures[future] = (i, article, per_article_path)
+
+            completed_generation = 0
+            for future in concurrent.futures.as_completed(pending_futures):
+                i, article, per_article_path = pending_futures[future]
+                try:
+                    article_index, accepted, decisions = future.result()
+                    completed_results[article_index] = (accepted, decisions)
+                    completed_generation += 1
+                    total_completed = resumed_articles + completed_generation
+                    logger.info(
+                        "Generation finished for '%s' (%d accepted, %d decisions)",
+                        article.title,
+                        len(accepted),
+                        len(decisions),
+                    )
+                    log_progress("Overall article progress", total_completed, len(sampled_articles))
+                except Exception as exc:
+                    completed_generation += 1
+                    total_completed = resumed_articles + completed_generation
+                    logger.exception("Generation failed for '%s': %s", article.title, exc)
+                    error_path = per_article_dir / (per_article_path.stem + ".error.txt")
+                    error_path.write_text(str(exc), encoding="utf-8")
+                    log_progress("Overall article progress", total_completed, len(sampled_articles))
+
+        for i in range(1, len(sampled_articles) + 1):
+            result = completed_results.get(i)
+            if result is None:
+                continue
+            accepted, decisions = result
+            all_rows.extend(accepted)
+            all_decisions.extend(decisions)
+
+        has_sufficient_cached_negatives, sampled_negative_rows, negative_counts = has_enough_cached_negative_rows(
+            per_article_dir,
+            content_types=requested_labels,
+            sample_size=args.sample_size,
+            seed=args.seed,
+        )
+    else:
+        logger.info(
+            "Skipping synthetic generation because cached negatives contain at least %d rows per requested content type after unique source_title sampling.",
+            args.sample_size,
+        )
+
+    cached_accepted_rows, cached_decisions = load_cached_results_from_per_article(per_article_dir)
+    save_jsonl(generated_jsonl_path, cached_accepted_rows)
+    save_jsonl(filter_log_path, cached_decisions)
+    all_rows = cached_accepted_rows
+    all_decisions = cached_decisions
+
+    if not positive_rows:
+        positive_rows = sample_panorama_positive_rows(
+            parquet_url=args.panorama_parquet_url,
+            parquet_path=panorama_parquet_path,
+            content_types=args.content_types,
+            sample_size=args.sample_size,
+            seed=args.seed,
+        )
+    binary_rows = build_binary_classification_rows(
+        positive_rows=positive_rows,
+        negative_rows=sampled_negative_rows,
+        seed=args.seed,
+    )
+    save_jsonl(binary_dataset_path, binary_rows)
 
     manifest = {
         "dump_url": args.dump_url,
         "dump_path": str(args.dump_path),
-        "sample_size_requested": args.sample_size,
-        "sample_size_actual": len(sampled_articles),
+        "sample_size_per_content_type": args.sample_size,
         "content_types": args.content_types,
         "entries_per_type_after_filter": args.entries_per_type,
         "generated_entries_per_type_before_filter": requested_generation_count,
@@ -1019,17 +1552,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "quality_max_output_tokens": args.quality_max_output_tokens,
         "max_workers": args.max_workers,
         "min_combined_score": args.min_combined_score,
-        "generated_rows_after_filter": len(all_rows),
+        "few_shot_per_type": args.few_shot_per_type,
+        "force_regenerate": args.force_regenerate,
+        "generated_rows_after_filter": len(load_jsonl(generated_jsonl_path)) if generated_jsonl_path.exists() else 0,
         "filter_decision_rows": len(all_decisions),
+        "negative_rows_selected_for_binary_dataset": len(sampled_negative_rows),
+        "negative_rows_selected_by_content_type": dict(negative_counts),
+        "positive_rows_selected_from_panorama": len(positive_rows),
+        "binary_dataset_rows": len(binary_rows),
+        "panorama_parquet_url": normalize_hf_file_url(args.panorama_parquet_url),
+        "panorama_parquet_path": str(panorama_parquet_path),
         "sampled_articles_file": str(sampled_articles_path),
         "aggregate_output_file": str(generated_jsonl_path),
         "filter_log_file": str(filter_log_path),
+        "binary_dataset_output_file": str(binary_dataset_path),
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     logger.info("Done. Aggregate output: %s", generated_jsonl_path)
     logger.info("Filter log: %s", filter_log_path)
-    logger.info("Generated rows after filtering: %d", len(all_rows))
+    logger.info("Binary dataset output: %s", binary_dataset_path)
     return 0
 
 
